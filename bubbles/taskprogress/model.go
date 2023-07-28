@@ -3,6 +3,8 @@ package taskprogress
 import (
 	"errors"
 	"fmt"
+	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -60,15 +62,25 @@ type Model struct {
 
 	// coordinate if there are any live components on the UI
 	done func()
+	once *sync.Once
+
+	// for debugging
+	name string
+}
+
+var f *os.File
+
+func Stdout() *os.File {
+	return f
+}
+
+func init() {
+	f, _ = os.Create("syft.log")
 }
 
 // New returns a model with default values.
-func New(wg *sync.WaitGroup, opts ...Option) Model {
+func New(wg *sync.WaitGroup, opts ...Option) *Model {
 	wg.Add(1)
-	once := sync.Once{}
-	done := func() {
-		once.Do(wg.Done)
-	}
 	spin := spinner.New()
 
 	// matches the same spinner as syft/grype
@@ -94,13 +106,10 @@ func New(wg *sync.WaitGroup, opts ...Option) Model {
 		ProgressBar:    prog,
 		UpdateDuration: 250 * time.Millisecond,
 		id:             nextID(),
-		done:           done,
+		//done:           done,
+		once: &sync.Once{},
 
-		TitleStyle: lipgloss.NewStyle().Bold(true),
-		//TitlePendingStyle: lipgloss.NewStyle().Bold(true).Foreground(lipgloss.AdaptiveColor{
-		//	Light: "#555555",
-		//	Dark:  "#AAAAAA",
-		// }),
+		TitleStyle:   lipgloss.NewStyle().Bold(true),
 		ContextStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")),
 		HintStyle:    lipgloss.NewStyle().Foreground(lipgloss.Color("#777777")),
 		SuccessStyle: lipgloss.NewStyle().Foreground(lipgloss.Color("10")), // 10 = high intensity green (ANSI 16 bit color code)
@@ -112,7 +121,15 @@ func New(wg *sync.WaitGroup, opts ...Option) Model {
 	for _, opt := range opts {
 		opt(&m)
 	}
-	return m
+	fmt.Fprintln(f, "[bubbletea.progress]: +1 for ", m.name, "\n", string(debug.Stack()))
+	m.done = func() {
+		m.once.Do(func() {
+			fmt.Fprintln(f, "[bubbletea.progress]: -1 for ", m.name, "\n", string(debug.Stack()))
+			wg.Done()
+			m.done = nil
+		})
+	}
+	return &m
 }
 
 func (m Model) hintCap(end bool) string {
@@ -127,7 +144,7 @@ func (m Model) hintCap(end bool) string {
 }
 
 // Init is the command that effectively starts the continuous update loop.
-func (m Model) Init() tea.Cmd {
+func (m *Model) Init() tea.Cmd {
 	cmds := []tea.Cmd{
 		// this is the periodic update of state information
 		func() tea.Msg {
@@ -167,7 +184,8 @@ func (m Model) Sequence() int {
 }
 
 // Update is the Tea update function.
-func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+func (m *Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	//fmt.Fprintf(f, "Update for %s: %s (msg %T)\n", m.name, formatProgress(m.progressor), msg)
 	switch msg := msg.(type) {
 	case tea.WindowSizeMsg:
 		m.WindowSize = msg
@@ -177,6 +195,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		tickCmd := m.handleTick(msg)
 		if tickCmd == nil {
 			// this tick is not meant for us
+			//fmt.Fprintf(f, "Foreign tick: (id %d vs %d, seq %d vs %d)\n",
+			//	msg.ID, m.id, msg.Sequence, m.sequence)
 			return m, nil
 		}
 
@@ -196,6 +216,9 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 			m.completed = c.Complete()
+			if m.completed {
+				//fmt.Fprintf(f, "Set completed for %[1]s with %[2]s (%[3]v %[3]T)\n", m.name, formatProgress(m.progressor), c.Error())
+			}
 			if c.Error() != nil && !errors.Is(c.Error(), progress.ErrCompleted) {
 				m.err = c.Error()
 			}
@@ -234,9 +257,23 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	}
 }
 
+func formatProgress(p progress.Progressor) string {
+	if p == nil {
+		return "<empty>"
+	}
+	prog := p.Progress()
+	return fmt.Sprint(prog.Percent(), "%", ", err=", prog.Error())
+}
+
 // View renders the model's view.
-func (m Model) View() string {
+func (m *Model) View() string {
+	if m.done == nil {
+		return ""
+	}
+	//fmt.Fprintf(f, "View for %s: %s\n", m.name, formatProgress(m.progressor))
 	if m.completed && m.HideOnSuccess {
+		//fmt.Println("[hideOnSuccess]: Schedule completion for", m.name)
+		m.done()
 		return ""
 	}
 	beforeProgress := " "
@@ -280,6 +317,7 @@ func (m Model) View() string {
 	}
 
 	if m.completed {
+		//fmt.Println("Schedule completion for", m.name)
 		defer m.done()
 	}
 

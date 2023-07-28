@@ -7,6 +7,12 @@ import (
 
 type Option func(*Model)
 
+func WithName(name string) Option {
+	return func(m *Model) {
+		m.name = name
+	}
+}
+
 func WithProgress(prog progress.Progressable) Option {
 	return func(m *Model) {
 		m.progressor = progress.NewGenerator(prog, prog)
